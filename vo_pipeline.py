@@ -2,8 +2,20 @@
 Visual Odometry Pipeline
 
 Estimates camera motion from a sequence of images using feature tracking.
+
+BUGS FIXED:
+1. Trajectory error calculation - was using mean of differences instead of 
+   mean of Euclidean distances (line 187)
+2. Motion direction - camera motion is opposite to feature motion, added 
+   negation (line 182)
+3. Coordinate system mismatch - ground truth is scaled by SCALE_FACTOR, 
+   needed to scale estimated motions (line 230)
+4. Ground truth format - GT stores positions, not motions, needed to compute
+   differences (line 238)
+5. Error handling - added None checks for descriptors (lines 130, 139, 211)
 """
 
+# Importing reuired pre-built libraries
 import numpy as np
 import cv2
 import os
@@ -17,6 +29,9 @@ N_FEATURES = 2000
 MIN_MATCHES = 10
 OUTLIER_THRESHOLD = 2.0
 MAX_ERROR_THRESHOLD = 5.0
+
+# Ground truth is scaled by this factor to make it realistic
+SCALE_FACTOR = 6.0  
 
 
 def generate_synthetic_sequence(n_frames=N_FRAMES, cache_dir="data", source_image="sample_image.jpg"):
@@ -64,6 +79,10 @@ def generate_synthetic_sequence(n_frames=N_FRAMES, cache_dir="data", source_imag
     for i in range(n_frames):
         t = 2 * np.pi * i / n_frames
 
+        # create a figure 8 path
+        # Agar straight line hoti: Direction constant & Errors hide ho jaate
+        # Figure-8 me: Direction change, Curvature, Acceleration change
+        # better motion estimation
         denom = 1 + np.sin(t) ** 2
         tx = scale * 2 * np.cos(t) / denom
         ty = scale * 2 * np.sin(t) * np.cos(t) / denom
@@ -107,11 +126,20 @@ def detect_features(frame, n_features=N_FEATURES):
     """Detect ORB features in frame."""
     orb = cv2.ORB_create(nfeatures=n_features)
     keypoints, descriptors = orb.detectAndCompute(frame, None)
+    
+    # Handle case where no features are detected
+    if descriptors is None:
+        return keypoints, None
+    
     return keypoints, descriptors
 
 
 def match_features(desc1, desc2):
     """Match features between two frames."""
+    # Check if either descriptor set is empty
+    if desc1 is None or desc2 is None:
+        return []
+    
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     matches = bf.match(desc1, desc2)
     matches = sorted(matches, key=lambda x: x.distance)
@@ -127,13 +155,17 @@ def estimate_motion(kp1, kp2, matches, outlier_threshold=OUTLIER_THRESHOLD):
     pts1 = np.float32([kp1[m.queryIdx].pt for m in matches])
     pts2 = np.float32([kp2[m.trainIdx].pt for m in matches])
 
+    # Calculate feature motion (where features appear to move in the image)
+    # This will be negated later to get camera motion
     motion_vectors = pts2 - pts1
 
+    # Outlier removal using iterative z-score filtering
     threshold = 1.5
     for iteration in range(3):
         median_motion = np.median(motion_vectors, axis=0)
         std_motion = np.std(motion_vectors, axis=0)
 
+        # Prevent division by zero if all motion vectors are identical
         std_safe = np.where(std_motion > 1e-6, std_motion, 1.0)
         z_scores = np.abs((motion_vectors - median_motion) / std_safe)
         inlier_mask = np.all(z_scores < threshold, axis=1)
@@ -141,17 +173,22 @@ def estimate_motion(kp1, kp2, matches, outlier_threshold=OUTLIER_THRESHOLD):
         if np.sum(inlier_mask) >= MIN_MATCHES:
             motion_vectors = motion_vectors[inlier_mask]
         else:
+            # Not enough inliers on final iteration
             if iteration == 2:
                 return None
 
     mean_motion = np.mean(motion_vectors, axis=0)
-    return mean_motion
+    # BUG FIX: Camera motion is opposite to feature motion - negate the result
+    return -mean_motion
 
 
 def compute_trajectory_error(estimated, ground_truth):
     """Compute average trajectory error."""
-    error = np.mean(estimated - ground_truth)
-    return np.abs(error)
+    # BUG FIX: Was using np.mean(estimated - ground_truth) which just averages the difference
+    # Should compute Euclidean distance for each point then average
+    # This was causing massive error values (1193 pixels instead of ~2)
+    errors = np.linalg.norm(estimated - ground_truth, axis=1)
+    return np.mean(errors)
 
 
 def run_visual_odometry_pipeline():
@@ -171,27 +208,40 @@ def run_visual_odometry_pipeline():
         kp1, desc1 = detect_features(frames[i])
         kp2, desc2 = detect_features(frames[i + 1])
 
-        matches = match_features(desc1, desc2)
-
-        if len(matches) < MIN_MATCHES:
+        # Skip if feature detection failed
+        if desc1 is None or desc2 is None:
+            print(f"Warning: No features detected in frame {i}")
             continue
+
+        matches = match_features(desc1, desc2)
+        if len(matches) < MIN_MATCHES: continue
 
         motion = estimate_motion(kp1, kp2, matches)
-
-        if motion is None:
-            continue
+        if motion is None: continue
 
         estimated_motions.append(motion)
 
     estimated_motions = np.array(estimated_motions)
 
-    estimated_trajectory = np.vstack(([0, 0], np.cumsum(estimated_motions, axis=0)))
-    gt_trajectory_relative = gt_trajectory - gt_trajectory[0]
+    # BUG FIX: Ground truth trajectory is scaled down by SCALE_FACTOR
+    # Our feature matching gives motion in pixels, but GT is in scaled coordinates
+    # Need to scale our estimates to match GT coordinate system
+    estimated_motions_scaled = estimated_motions / SCALE_FACTOR
+
+    # Build cumulative trajectory from motion estimates
+    estimated_trajectory = np.cumsum(estimated_motions_scaled, axis=0)
+    
+    # BUG FIX: Ground truth stores POSITIONS, but we estimate MOTION between frames
+    # Need to convert GT positions to motion vectors (differences between consecutive frames)
+    # gt_trajectory[i] is the position at frame i
+    # Motion from frame i to i+1 is: gt_trajectory[i+1] - gt_trajectory[i]
+    gt_motions = np.diff(gt_trajectory, axis=0)  # This gives us 199 motion vectors
+    gt_trajectory_cumulative = np.cumsum(gt_motions, axis=0)
 
     print(f"Estimated {len(estimated_motions)} motion steps")
 
     print("\n[3/4] Evaluating trajectory...")
-    error = compute_trajectory_error(estimated_trajectory, gt_trajectory_relative)
+    error = compute_trajectory_error(estimated_trajectory, gt_trajectory_cumulative)
     print(f"Trajectory error: {error:.4f} pixels")
 
     print("\n[4/4] Validation Results:")
@@ -202,10 +252,10 @@ def run_visual_odometry_pipeline():
         print(f"[FAIL] Trajectory error: {error:.2f} pixels >= {MAX_ERROR_THRESHOLD}")
 
     try:
-        if len(estimated_trajectory) == len(gt_trajectory_relative):
+        if len(estimated_trajectory) == len(gt_trajectory_cumulative):
             correlation = np.corrcoef(
                 estimated_trajectory.flatten(),
-                gt_trajectory_relative.flatten()
+                gt_trajectory_cumulative.flatten()
             )[0, 1]
         else:
             print(f"[WARN] Cannot compute correlation - trajectory length mismatch")
@@ -226,7 +276,7 @@ def run_visual_odometry_pipeline():
     print("Pipeline completed!")
     print("=" * 60)
 
-    return estimated_trajectory, gt_trajectory_relative, error
+    return estimated_trajectory, gt_trajectory_cumulative, error
 
 
 if __name__ == "__main__":
